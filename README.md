@@ -26,6 +26,10 @@ Talking to the receiver requires read/write access to its `hidraw` device node, 
 
 No external dependencies. Everything needed to talk to the receiver is built in.
 
+## Credit where credit is due
+
+This would not have been possible without the hard work, reverse-engineering and dedication of the people behind [Solaar](https://github.com/pwr-Solaar/Solaar) who did the original heavy lifting to bring Logitech device support to Linux.
+
 ## License
 
 MIT

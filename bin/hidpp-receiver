@@ -1,0 +1,621 @@
+#!/usr/bin/env python3
+"""Talk raw HID++ 1.0 to Logitech Unifying/Bolt receivers over hidraw.
+
+No Solaar, no daemon: every invocation opens the receiver's hidraw node,
+does one request/response round trip (or a couple, for a pairing-lock
+command), prints JSON (for `list`) or exits, and closes the fd again.
+"""
+import argparse
+import json
+import os
+import random
+import select
+import struct
+import sys
+import time
+
+HIDRAW_CLASS = "/sys/class/hidraw"
+DEV_ROOT = "/dev"
+
+RECEIVER_PIDS = {
+    0xC52B: "unifying",
+    0xC532: "unifying",  # the only other Unifying receiver Logitech has shipped
+    0xC548: "bolt",
+}
+
+REG_RECEIVER_CONNECTION = 0x02
+REG_RECEIVER_PAIRING = 0xB2
+REG_RECEIVER_INFO = 0xB5
+REG_BOLT_DEVICE_DISCOVERY = 0xC0
+REG_BOLT_PAIRING = 0xC1
+
+SUBID_SET_REGISTER = 0x80
+SUBID_GET_REGISTER = 0x81
+SUBID_SET_LONG_REGISTER = 0x82
+SUBID_GET_LONG_REGISTER = 0x83
+SUBID_ERROR = 0x8F
+
+SHORT_REPORT_ID = 0x10
+LONG_REPORT_ID = 0x11
+SHORT_SIZE = 7
+LONG_SIZE = 20
+
+RECEIVER_DEVNUM = 0xFF
+MAX_SLOTS = 6
+
+NOTIF_PASSKEY_REQUEST = 0x4D
+NOTIF_DEVICE_DISCOVERY = 0x4F
+NOTIF_PAIRING_STATUS = 0x54
+
+BOLT_PAIRING_ERROR = {
+    0x01: "device timeout",
+    0x02: "failed",
+}
+
+DEVICE_KIND = {
+    0x00: "unknown", 0x01: "keyboard", 0x02: "mouse", 0x03: "numpad",
+    0x04: "presenter", 0x07: "remote", 0x08: "trackball", 0x09: "touchpad",
+    0x0A: "tablet", 0x0B: "gamepad", 0x0C: "joystick",
+}
+
+
+class HidppError(Exception):
+    pass
+
+
+class HidppTimeout(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- discovery
+
+def _read_uevent(path):
+    props = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.rstrip("\n").split("=", 1)
+                    props[k] = v
+    except OSError:
+        pass
+    return props
+
+
+def discover_receivers():
+    """Group hidraw nodes by physical receiver (shared parent USB device)."""
+    groups = {}
+    if not os.path.isdir(HIDRAW_CLASS):
+        return groups
+    for name in sorted(os.listdir(HIDRAW_CLASS)):
+        dev_dir = os.path.join(HIDRAW_CLASS, name, "device")
+        props = _read_uevent(os.path.join(dev_dir, "uevent"))
+        hid_id = props.get("HID_ID", "")
+        parts = hid_id.split(":")
+        if len(parts) != 3:
+            continue
+        try:
+            vendor = int(parts[1], 16)
+            product = int(parts[2], 16)
+        except ValueError:
+            continue
+        if vendor != 0x046D or product not in RECEIVER_PIDS:
+            continue
+        real = os.path.realpath(dev_dir)
+        usb_iface_dir = os.path.dirname(real)
+        usb_device_dir = os.path.dirname(usb_iface_dir)
+        group = groups.setdefault(usb_device_dir, {
+            "id": usb_device_dir,
+            "kind": RECEIVER_PIDS[product],
+            "product": product,
+            "candidates": [],
+        })
+        group["candidates"].append(os.path.join(DEV_ROOT, name))
+    return groups
+
+
+def find_receiver(receiver_id):
+    groups = discover_receivers()
+    group = groups.get(receiver_id)
+    if group is None:
+        raise HidppError(f"receiver not found: {receiver_id}")
+    return group
+
+
+# --------------------------------------------------------------- wire format
+
+def _pack_request(subid, register, params=b"", devnumber=RECEIVER_DEVNUM):
+    body = bytes([subid, register]) + bytes(params)
+    if subid == SUBID_SET_LONG_REGISTER:
+        body = body.ljust(LONG_SIZE - 2, b"\x00")[: LONG_SIZE - 2]
+        return bytes([LONG_REPORT_ID, devnumber]) + body
+    body = body.ljust(SHORT_SIZE - 2, b"\x00")[: SHORT_SIZE - 2]
+    return bytes([SHORT_REPORT_ID, devnumber]) + body
+
+
+def _read_one(fd, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        r, _, _ = select.select([fd], [], [], remaining)
+        if not r:
+            continue
+        data = os.read(fd, 32)
+        if not data:
+            continue
+        report_id = data[0]
+        if report_id == SHORT_REPORT_ID and len(data) >= SHORT_SIZE:
+            return data[:SHORT_SIZE]
+        if report_id == LONG_REPORT_ID and len(data) >= LONG_SIZE:
+            return data[:LONG_SIZE]
+
+
+def _request(fd, subid, register, params=b"", timeout=1.0, devnumber=RECEIVER_DEVNUM):
+    """One HID++1.0 request/response round trip. Returns payload bytes past
+    the echoed [subid, register] header, or raises HidppError/HidppTimeout."""
+    frame = _pack_request(subid, register, params, devnumber)
+    os.write(fd, frame)
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise HidppTimeout(f"timeout on subid=0x{subid:02x} register=0x{register:02x}")
+        payload = _read_one(fd, remaining)
+        if payload is None:
+            raise HidppTimeout(f"timeout on subid=0x{subid:02x} register=0x{register:02x}")
+        reply_devnumber = payload[1]
+        reply_subid = payload[2]
+        reply_register = payload[3]
+        if reply_devnumber != devnumber:
+            continue  # unrelated reply/notification for another device
+        if reply_subid == SUBID_ERROR and reply_register == subid:
+            err_register = payload[4]
+            err_code = payload[5] if len(payload) > 5 else 0
+            if err_register == register:
+                raise HidppError(
+                    f"receiver error 0x{err_code:02x} on subid=0x{subid:02x} register=0x{register:02x}"
+                )
+            continue
+        if reply_subid == subid and reply_register == register:
+            return payload[4:]
+        # unrelated notification frame; keep waiting until deadline
+
+
+def get_register(fd, register, params=b"", timeout=1.0, devnumber=RECEIVER_DEVNUM):
+    return _request(fd, SUBID_GET_REGISTER, register, params, timeout, devnumber)
+
+
+def get_long_register(fd, register, params=b"", timeout=1.0, devnumber=RECEIVER_DEVNUM):
+    return _request(fd, SUBID_GET_LONG_REGISTER, register, params, timeout, devnumber)
+
+
+def set_register(fd, register, params=b"", timeout=1.0, devnumber=RECEIVER_DEVNUM):
+    return _request(fd, SUBID_SET_REGISTER, register, params, timeout, devnumber)
+
+
+def set_long_register(fd, register, params=b"", timeout=1.0, devnumber=RECEIVER_DEVNUM):
+    return _request(fd, SUBID_SET_LONG_REGISTER, register, params, timeout, devnumber)
+
+
+ERR_INVALID_SUB_ID_COMMAND = 0x01
+ERR_CONNECTION_REQUEST_FAILED = 0x04
+ERR_RESOURCE_ERROR = 0x09
+ERR_UNKNOWN_DEVICE = 0x08
+
+
+def device_online(fd, devnumber, timeout=0.8):
+    """Whether the peripheral in this slot currently answers, addressed
+    directly by its own device number (not the receiver's 0xFF) — a sleeping
+    or out-of-range device fails here even though its pairing record still
+    reads back fine from the receiver. This is a HID++ "ping": feature 0x00
+    (root) function 1 (GetProtocolVersion) with a random mark byte, which
+    HID++2.0 peripherals answer directly and HID++1.0 ones answer with a
+    well-known "invalid sub-id" error — both of which mean "present"; a
+    timeout or a resource/unknown-device error means "not present"."""
+    mark = random.randrange(256)
+    frame = _pack_request(0x00, 0x10, bytes([0, 0, mark]), devnumber)
+    os.write(fd, frame)
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        payload = _read_one(fd, remaining)
+        if payload is None:
+            return False
+        if payload[1] != devnumber:
+            continue
+        if payload[2] == SUBID_ERROR and payload[3] == 0x00 and payload[4] == 0x10:
+            err_code = payload[5] if len(payload) > 5 else 0
+            if err_code == ERR_INVALID_SUB_ID_COMMAND:
+                return True  # HID++1.0 device, but present
+            if err_code in (ERR_RESOURCE_ERROR, ERR_CONNECTION_REQUEST_FAILED, ERR_UNKNOWN_DEVICE):
+                return False
+            continue
+        if payload[2] == 0x00 and payload[3] == 0x10 and len(payload) > 6 and payload[6] == mark:
+            return True  # HID++2.0 device, present
+        # unrelated frame; keep waiting until deadline
+
+
+def get_feature_index(fd, devnumber, feature_id, timeout=0.4):
+    """HID++2.0 ROOT.GetFeature: look up which feature-table index (if any)
+    implements `feature_id` on this device. Root is always feature index 0,
+    function 0."""
+    try:
+        reply = _request(fd, 0x00, 0x00, feature_id.to_bytes(2, "big"), timeout, devnumber)
+    except (HidppError, HidppTimeout):
+        return None
+    if not reply:
+        return None
+    return reply[0] or None
+
+
+def device_battery(fd, devnumber, timeout=0.4):
+    """(battery_percent, battery_status) for this device — either can be
+    None. Tries the modern HID++2.0 UNIFIED_BATTERY feature first, then the
+    older BATTERY_STATUS feature, then the legacy HID++1.0 BATTERY_CHARGE
+    register, then finally the legacy HID++1.0 BATTERY_STATUS register.
+    That last one — used by pre-2.0 devices like the K800 — sometimes
+    reports only a charging status and no percentage at all (observed live:
+    a K800 plugged in and actively charging returns status_byte=0x00, which
+    has no entry in the level-bucket table, alongside a charging_byte that
+    decodes to "recharging" — so a device can be online with a real,
+    meaningful status while genuinely having no numeric charge level to
+    report at that moment). Matches Solaar's status_byte/charging_byte
+    split for this register (lib/logitech_receiver/hidpp10.py)."""
+    idx = get_feature_index(fd, devnumber, 0x1004, timeout)  # UNIFIED_BATTERY
+    if idx:
+        try:
+            reply = _request(fd, idx, 0x10, b"", timeout, devnumber)
+            discharge, level, status_code = reply[0], reply[1], reply[2]
+            # 0=discharging 1=charging 2=charging slowly 3=full 4=error
+            status = {0: "discharging", 1: "recharging", 2: "recharging", 3: "full"}.get(status_code)
+            if discharge:
+                return discharge, status
+            pct = {8: 100, 4: 70, 2: 30, 1: 10}.get(level)
+            if pct:
+                return pct, status
+        except (HidppError, HidppTimeout):
+            pass
+
+    idx = get_feature_index(fd, devnumber, 0x1000, timeout)  # BATTERY_STATUS
+    if idx:
+        try:
+            reply = _request(fd, idx, 0x00, b"", timeout, devnumber)
+            status_code = reply[2] if len(reply) > 2 else None
+            # 0=discharging 1=recharging 2=almost full 3=full 4=slow
+            # recharge 5=invalid battery 6=thermal error 7=other error
+            status = {0: "discharging", 1: "recharging", 2: "recharging", 3: "full", 4: "recharging"}.get(status_code)
+            if reply[0]:
+                return reply[0], status
+        except (HidppError, HidppTimeout):
+            pass
+
+    try:
+        reply = get_register(fd, 0x0D, timeout=timeout, devnumber=devnumber)  # BATTERY_CHARGE
+        if reply[0]:
+            return reply[0], None
+    except (HidppError, HidppTimeout):
+        pass
+
+    try:
+        reply = get_register(fd, 0x07, timeout=timeout, devnumber=devnumber)  # BATTERY_STATUS (legacy)
+        status_byte, charging_byte = reply[0], reply[1]
+        pct = {7: 100, 5: 70, 3: 40, 1: 10}.get(status_byte)
+        status = None
+        if charging_byte == 0x00:
+            status = "discharging"
+        elif charging_byte & 0x21 == 0x21:
+            status = "recharging"
+        elif charging_byte & 0x22 == 0x22:
+            status = "full"
+        return pct, status
+    except (HidppError, HidppTimeout):
+        pass
+
+    return None, None
+
+
+def open_working_hidraw(candidates):
+    """A receiver exposes several hidraw nodes (its USB interfaces); only one
+    speaks HID++ short/long reports (report IDs 0x10/0x11). Identify it from
+    its HID report descriptor rather than probing with real I/O: the control
+    endpoint (ep0) is shared by all interfaces of the same USB device, and a
+    write aimed at the wrong interface can stall it (EPIPE) for the others
+    too, not just fail cleanly for itself."""
+    for path in candidates:
+        name = os.path.basename(path)
+        try:
+            with open(f"{HIDRAW_CLASS}/{name}/device/report_descriptor", "rb") as f:
+                descriptor = f.read()
+        except OSError:
+            continue
+        if bytes([0x85, SHORT_REPORT_ID]) in descriptor and bytes([0x85, LONG_REPORT_ID]) in descriptor:
+            fd = os.open(path, os.O_RDWR)
+            try:
+                # A cold interface answers a long-register read with EPIPE
+                # until it has handled one short-register round trip first.
+                get_register(fd, REG_RECEIVER_CONNECTION, timeout=0.5)
+            except (HidppError, HidppTimeout, OSError):
+                pass
+            return fd
+    raise HidppError("no hidraw interface on this receiver declares HID++ short/long reports")
+
+
+# ------------------------------------------------------------- pairing info
+
+def _codename(reply):
+    length = min(reply[1], len(reply) - 2)
+    return reply[2 : 2 + length].decode("ascii", errors="replace")
+
+
+def _looks_like_name(name):
+    """The receiver sometimes hasn't finished fetching a paired device's name
+    over RF yet (right after the interface is opened cold) and answers the
+    0x40-series register with a not-ready placeholder instead of the real
+    name — indistinguishable from a genuine reply by its header, but garbage
+    once decoded as text. Retrying shortly after always picks up the real,
+    cached name."""
+    return bool(name) and all(32 <= ord(c) < 127 for c in name)
+
+
+def unifying_slot(fd, n):
+    pair_info = get_long_register(fd, REG_RECEIVER_INFO, bytes([0x20 + n - 1]))
+    wpid = pair_info[3:5].hex()
+    if wpid == "0000":
+        return None
+    kind_byte = pair_info[7] & 0x0F
+    name = ""
+    # A cold receiver can take a couple of seconds to finish fetching a
+    # device's name over RF before this register stops answering with a
+    # not-ready placeholder (see _looks_like_name) — worth waiting out here
+    # rather than surfacing the placeholder to the UI even briefly.
+    deadline = time.monotonic() + 2.5
+    while True:
+        name_reply = get_long_register(fd, REG_RECEIVER_INFO, bytes([0x40 + n - 1]))
+        name = _codename(name_reply)
+        if _looks_like_name(name) or time.monotonic() >= deadline:
+            break
+        time.sleep(0.2)
+    return {
+        "slot": n,
+        "wpid": wpid,
+        "kind": DEVICE_KIND.get(kind_byte, "unknown"),
+        "name": name if _looks_like_name(name) else "Unknown device",
+    }
+
+
+def bolt_slot(fd, n):
+    pair_info = get_long_register(fd, REG_RECEIVER_INFO, bytes([0x50 + n]))
+    wpid = (pair_info[3:4] + pair_info[2:3]).hex()
+    if wpid == "0000":
+        return None
+    kind_byte = pair_info[1] & 0x0F
+    name_reply = get_long_register(fd, REG_RECEIVER_INFO, bytes([0x60 + n, 0x01]))
+    length = min(14, name_reply[2])
+    name = name_reply[3 : 3 + length].decode("ascii", errors="replace")
+    return {
+        "slot": n,
+        "wpid": wpid,
+        "kind": DEVICE_KIND.get(kind_byte, "unknown"),
+        "name": name or "Unknown device",
+    }
+
+
+def list_receivers():
+    groups = discover_receivers()
+    out = []
+    for receiver_id, group in groups.items():
+        entry = {
+            "id": receiver_id,
+            "kind": group["kind"],
+            "product": f"{group['product']:04X}",
+            "devices": [],
+            "error": None,
+        }
+        fd = None
+        try:
+            fd = open_working_hidraw(group["candidates"])
+            for n in range(1, MAX_SLOTS + 1):
+                try:
+                    slot = unifying_slot(fd, n) if group["kind"] == "unifying" else bolt_slot(fd, n)
+                except (HidppError, HidppTimeout):
+                    slot = None
+                if slot is None:
+                    continue
+                slot["online"] = device_online(fd, n)
+                slot["battery"], slot["batteryStatus"] = device_battery(fd, n) if slot["online"] else (None, None)
+                entry["devices"].append(slot)
+        except (HidppError, OSError) as e:
+            entry["error"] = str(e)
+        finally:
+            if fd is not None:
+                os.close(fd)
+        out.append(entry)
+    return out
+
+
+# -------------------------------------------------------------- pairing ops
+
+def pair_start(receiver_id, slot, timeout):
+    group = find_receiver(receiver_id)
+    if group["kind"] != "unifying":
+        raise HidppError("pairing is only supported for Unifying receivers in this version")
+    fd = open_working_hidraw(group["candidates"])
+    try:
+        set_register(fd, REG_RECEIVER_PAIRING, bytes([0x01, slot & 0xFF, timeout & 0xFF]))
+    finally:
+        os.close(fd)
+
+
+def pair_stop(receiver_id):
+    group = find_receiver(receiver_id)
+    fd = open_working_hidraw(group["candidates"])
+    try:
+        if group["kind"] == "unifying":
+            set_register(fd, REG_RECEIVER_PAIRING, bytes([0x02, 0x00, 0x00]))
+        else:
+            set_register(fd, REG_BOLT_DEVICE_DISCOVERY, bytes([0x00, 0x02]))
+    finally:
+        os.close(fd)
+
+
+def unpair(receiver_id, slot):
+    group = find_receiver(receiver_id)
+    fd = open_working_hidraw(group["candidates"])
+    try:
+        if group["kind"] == "unifying":
+            set_register(fd, REG_RECEIVER_PAIRING, bytes([0x03, slot & 0xFF]))
+        else:
+            set_long_register(fd, REG_BOLT_PAIRING, bytes([0x03, slot & 0xFF]))
+    finally:
+        os.close(fd)
+
+
+def bolt_discover(receiver_id, timeout=45):
+    """Scan for discoverable Bolt devices, printing one JSON line per device
+    as soon as it's identified (streaming, so a caller can show results
+    live). A device broadcasts repeatedly while discoverable, in two parts
+    (address+kind, then name) sharing a 16-bit counter; we correlate on that
+    counter and emit each distinct address only once."""
+    group = find_receiver(receiver_id)
+    if group["kind"] != "bolt":
+        raise HidppError("discovery is only supported for Bolt receivers")
+    fd = open_working_hidraw(group["candidates"])
+    try:
+        set_register(fd, 0x00, bytes([0x00, 0x09, 0x00]))
+        set_register(fd, REG_BOLT_DEVICE_DISCOVERY, bytes([timeout & 0xFF, 0x01]))
+        pending = {}
+        emitted = set()
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            r, _, _ = select.select([fd], [], [], remaining)
+            if not r:
+                continue
+            data = os.read(fd, 64)
+            if len(data) < 20 or data[2] != NOTIF_DEVICE_DISCOVERY:
+                continue
+            counter = data[3] + data[4] * 256
+            part = data[5]
+            entry = pending.setdefault(counter, {})
+            if part == 0:
+                entry["address"] = data[10:16].hex()
+                entry["kind"] = DEVICE_KIND.get(data[7] & 0x0F, "unknown")
+                entry["authentication"] = data[18]
+            elif part == 1:
+                length = data[6]
+                entry["name"] = data[7 : 7 + length].decode("ascii", errors="replace")
+            if "address" in entry and "name" in entry and entry["address"] not in emitted:
+                emitted.add(entry["address"])
+                print(json.dumps(entry))
+                sys.stdout.flush()
+        set_register(fd, REG_BOLT_DEVICE_DISCOVERY, bytes([0x00, 0x02]))
+    finally:
+        os.close(fd)
+
+
+def bolt_pair(receiver_id, address_hex, authentication, slot=0, entropy=20, timeout=25):
+    """Pair a device found by bolt-discover. Prints a `passkey` line the
+    moment the receiver requests one (the user must type those digits on
+    the device itself), then a final `paired`/`failed`/`timeout` line."""
+    group = find_receiver(receiver_id)
+    if group["kind"] != "bolt":
+        raise HidppError("pairing is only supported for Bolt receivers here")
+    address = bytes.fromhex(address_hex)
+    fd = open_working_hidraw(group["candidates"])
+    try:
+        set_long_register(
+            fd, REG_BOLT_PAIRING, bytes([0x01, slot & 0xFF]) + address + bytes([authentication & 0xFF, entropy & 0xFF])
+        )
+        result = {"status": "timeout"}
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            r, _, _ = select.select([fd], [], [], remaining)
+            if not r:
+                continue
+            data = os.read(fd, 64)
+            if len(data) < 7:
+                continue
+            subid = data[2]
+            if subid == NOTIF_PASSKEY_REQUEST and len(data) >= 20:
+                passkey = data[4:10].decode("ascii", errors="replace")
+                print(json.dumps({"status": "passkey", "passkey": passkey}))
+                sys.stdout.flush()
+            elif subid == NOTIF_PAIRING_STATUS:
+                addr_field = data[3]
+                err = data[4] if len(data) > 4 else 0
+                if addr_field == 0x02:
+                    if err:
+                        result = {"status": "failed", "error": BOLT_PAIRING_ERROR.get(err, f"error 0x{err:02x}")}
+                    else:
+                        result = {"status": "paired"}
+                    break
+        print(json.dumps(result))
+        sys.stdout.flush()
+    finally:
+        os.close(fd)
+
+
+# ------------------------------------------------------------------- main
+
+def main():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("list")
+
+    p = sub.add_parser("pair-start")
+    p.add_argument("receiver_id")
+    p.add_argument("--slot", type=int, default=0)
+    p.add_argument("--timeout", type=int, default=30)
+
+    p = sub.add_parser("pair-stop")
+    p.add_argument("receiver_id")
+
+    p = sub.add_parser("unpair")
+    p.add_argument("receiver_id")
+    p.add_argument("slot", type=int)
+
+    p = sub.add_parser("bolt-discover")
+    p.add_argument("receiver_id")
+    p.add_argument("--timeout", type=int, default=45)
+
+    p = sub.add_parser("bolt-pair")
+    p.add_argument("receiver_id")
+    p.add_argument("address")
+    p.add_argument("authentication", type=lambda s: int(s, 0))
+    p.add_argument("--slot", type=int, default=0)
+    p.add_argument("--entropy", type=int, default=20)
+    p.add_argument("--timeout", type=int, default=25)
+
+    args = parser.parse_args()
+
+    try:
+        if args.command == "list":
+            json.dump(list_receivers(), sys.stdout)
+            sys.stdout.write("\n")
+        elif args.command == "pair-start":
+            pair_start(args.receiver_id, args.slot, args.timeout)
+        elif args.command == "pair-stop":
+            pair_stop(args.receiver_id)
+        elif args.command == "unpair":
+            unpair(args.receiver_id, args.slot)
+        elif args.command == "bolt-discover":
+            bolt_discover(args.receiver_id, args.timeout)
+        elif args.command == "bolt-pair":
+            bolt_pair(args.receiver_id, args.address, args.authentication, args.slot, args.entropy, args.timeout)
+    except (HidppError, HidppTimeout, OSError) as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

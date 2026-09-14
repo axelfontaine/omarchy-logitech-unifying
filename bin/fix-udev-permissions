@@ -1,0 +1,43 @@
+#!/bin/bash
+# Grants the active seat user access to this machine's Logitech Unifying and
+# Bolt receiver hidraw nodes. Meant to be run via `pkexec` from the plugin
+# panel's "Fix permissions" button, or by hand with sudo.
+#
+# Note: this grants access to ALL of the Bolt receiver's hidraw interfaces,
+# including its boot-keyboard/boot-mouse ones (it exposes those under the
+# same USB product ID as its HID++ control channel, unlike the Unifying
+# receiver). An attempt was made to scope the Bolt line down to just its
+# non-boot interface via ATTRS{bInterfaceProtocol}=="00", but udev requires
+# every ATTRS{} condition in one rule to resolve against a single ancestor
+# device, and idVendor/idProduct (receiver-level) vs bInterfaceProtocol
+# (interface-level) never share one — the rule silently never matched
+# anything. A working alternative (chained ENV{}/IMPORT{parent} rules across
+# the usb -> hid -> hidraw device levels) needed a full `udevadm trigger
+# --action=add --subsystem-match=usb`, which is a system-wide USB re-probe —
+# too broad and slow to run from an automated "fix" button (it hung for over
+# 30s in testing). Left as a known gap rather than risk that.
+set -euo pipefail
+
+RULES_FILE="/etc/udev/rules.d/72-logi-receivers.rules"
+
+cat > "$RULES_FILE" <<'RULES'
+# Installed by the axel.logi-bolt / axelfontaine.logitech-unifying Omarchy shell plugins.
+# Grants the active seat user read/write access to the hidraw nodes of these
+# specific Logitech receivers only (by USB vendor+product ID) — not to
+# hidraw devices generally.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c52b", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c532", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c548", TAG+="uaccess"
+RULES
+
+udevadm control --reload
+
+# A plain (default "change") trigger does not make systemd-logind re-derive
+# ACLs for devices that are already present — neither to grant a newly-added
+# uaccess tag nor to revoke one that was removed. Only a real remove-then-add
+# cycle (equivalent to a physical replug) does. Verified empirically on this
+# machine: a "change" trigger left every one of these hidraw nodes with no
+# ACL for the seat user at all, even though the just-reloaded rule granted
+# one.
+udevadm trigger --action=remove --subsystem-match=hidraw
+udevadm trigger --action=add --subsystem-match=hidraw

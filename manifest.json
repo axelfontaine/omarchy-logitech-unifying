@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "axelfontaine.logitech-unifying",
+  "name": "Logitech Unifying",
+  "version": "1.0.0",
+  "author": "axelfontaine",
+  "license": "MIT",
+  "description": "Show, pair and unpair devices on your Logitech Unifying receiver",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Logitech Unifying",
+    "description": "Show, pair and unpair devices on your Logitech Unifying receiver",
+    "category": "Hardware",
+    "allowMultiple": false
+  }
+}

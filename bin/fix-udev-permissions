@@ -11,17 +11,22 @@
 # every ATTRS{} condition in one rule to resolve against a single ancestor
 # device, and idVendor/idProduct (receiver-level) vs bInterfaceProtocol
 # (interface-level) never share one — the rule silently never matched
-# anything. A working alternative (chained ENV{}/IMPORT{parent} rules across
-# the usb -> hid -> hidraw device levels) needed a full `udevadm trigger
-# --action=add --subsystem-match=usb`, which is a system-wide USB re-probe —
-# too broad and slow to run from an automated "fix" button (it hung for over
-# 30s in testing). Left as a known gap rather than risk that.
+# anything. A chained alternative (ENV{}/IMPORT{parent} rules relayed across
+# the usb -> hid -> hidraw device levels) didn't reliably scope things down
+# either in testing, and — contrary to an earlier assumption here — getting
+# it to re-evaluate at all needs a real `udevadm trigger --subsystem-match=usb`
+# remove/add cycle, which causes a genuine system-wide USB disconnect and
+# re-enumeration (confirmed in the kernel log), not just a cheap synthetic
+# uevent replay. Too disruptive to run from an automated "fix" button for a
+# benefit this small: it would only deny rw on two unused boot-HID
+# interfaces that Solaar's own upstream udev rule doesn't bother scoping out
+# either. Left as a known gap rather than risk that.
 set -euo pipefail
 
 RULES_FILE="/etc/udev/rules.d/72-logi-receivers.rules"
 
 cat > "$RULES_FILE" <<'RULES'
-# Installed by the axel.logi-bolt / axelfontaine.logitech-unifying Omarchy shell plugins.
+# Installed by the axelfontaine.logitech-bolt / axel.logi-unifying Omarchy shell plugins.
 # Grants the active seat user read/write access to the hidraw nodes of these
 # specific Logitech receivers only (by USB vendor+product ID) — not to
 # hidraw devices generally.

@@ -29,6 +29,12 @@ Panel {
   // list with no way to reach it from the (now hidden) bar icon.
   onAnyReceiverChanged: if (!anyReceiver && root.opened) root.close()
 
+  // One-shot initial list, since presence after this is tracked by
+  // hotplugMonitor rather than a periodic timer — without this, a receiver
+  // that was already plugged in before the shell started would never be
+  // noticed (no add event ever fires for it).
+  Component.onCompleted: root.refresh()
+
   property bool isPairing: false
   property int pairingSecondsLeft: 0
   // Device count when the lock was opened, so a poll that sees a new
@@ -38,8 +44,7 @@ Panel {
   // { slot, name } while the unpair confirmation is open, else null
   property var pendingUnpair: null
 
-  // Mouse-driven row-hover state for the device list, mirroring the
-  // Bluetooth panel's DeviceRow/actionFocused pattern: only one row's
+  // Mouse-driven row-hover state for the device list: only one row's
   // highlight is ever shown at a time, and when the pointer is over a
   // row's unpair button, actionFocused hands the highlight to the button
   // instead of the row it sits in — otherwise the two overlapping
@@ -60,11 +65,9 @@ Panel {
     fixPermsProc.running = true
   }
 
-  // Keyboard/mouse cursor helpers, mirroring the Bluetooth panel's
-  // moveCursor/moveCursorH/activateCursor/deleteSelected — j/k (or arrows)
-  // walk the header button and device rows, h/l (or arrows) hand focus
-  // between a row and its unpair button, Enter activates whatever has
-  // focus, and 'x' unpairs directly.
+  // Keyboard cursor helpers: j/k (or arrows) walk the header button and
+  // device rows, h/l (or arrows) hand focus between a row and its unpair
+  // button, Enter activates whatever has focus, and 'x' unpairs directly.
   function setHeaderCursor() {
     root.cursorActive = true
     root.selectedIndex = -1
@@ -208,18 +211,52 @@ Panel {
     }
   }
 
+  // Presence (receiver plugged/unplugged) is tracked by hotplugMonitor, not
+  // polling — so this timer only needs to run while there's a popout (or an
+  // in-flight pairing lock) actually showing device state that can go
+  // stale: online/battery for already-known devices. It stays paused,
+  // costing nothing, whenever the panel is closed and idle.
   Timer {
-    // Always runs — not just while the panel is open — so the bar icon
-    // (which hides itself when no receiver is present, and shows battery
-    // state on hover-free glance) reflects reality without the user having
-    // to open the popout first. Polls faster while the popout is open or a
-    // pairing lock is active (also kept alive through the popout getting
-    // dismissed mid-pairing) for snappier feedback there.
     interval: (root.opened || root.isPairing) ? 4000 : 15000
     repeat: true
-    running: true
+    running: root.opened || root.isPairing
     triggeredOnStart: true
     onTriggered: root.refresh()
+  }
+
+  // Long-lived, not periodic: blocks on the udev netlink socket rather than
+  // polling, so a receiver plugged in (or removed) while the panel is
+  // closed is picked up immediately. Subscribing to uevents needs no
+  // special permission — only actually opening the resulting hidraw node
+  // does, which fixPermsProc handles separately.
+  Process {
+    id: hotplugMonitor
+    command: ["udevadm", "monitor", "--udev", "--subsystem-match=hidraw"]
+    // Started imperatively (Component.onCompleted below) rather than via a
+    // declarative `running: true` here — every other Process in this file
+    // follows the same pattern, since setting running at construction time
+    // can race command still being applied.
+    Component.onCompleted: running = true
+    stdout: SplitParser {
+      // udevadm prints a KERNEL line and a UDEV line per event; only react
+      // to the latter (the post-rule-processing one) to avoid a redundant
+      // second refresh for the same event.
+      onRead: function(line) {
+        if (line.indexOf("UDEV") === 0 && (line.indexOf(" add ") !== -1 || line.indexOf(" remove ") !== -1)) {
+          root.refresh()
+        }
+      }
+    }
+    // Restart on an unexpected exit (rather than silently going deaf to
+    // hotplug events for the rest of the session), with a short backoff so
+    // a persistently-failing udevadm doesn't spin.
+    onExited: hotplugRestart.restart()
+  }
+
+  Timer {
+    id: hotplugRestart
+    interval: 5000
+    onTriggered: hotplugMonitor.running = true
   }
 
   // A short extra refresh a couple seconds after an action, so the list
@@ -410,8 +447,7 @@ Panel {
               readonly property var device: modelData
               // Only one row's highlight is shown at a time (root.selectedIndex),
               // and root.actionFocused hands it from the row to the unpair
-              // button when the pointer is over the button instead — same
-              // pattern as the Bluetooth panel's DeviceRow/forgetBtn, needed
+              // button when the pointer is over the button instead — needed
               // because the button sits inside the row's own hover area and
               // the two would otherwise fight over the hover visuals.
               readonly property bool rowSelected: root.cursorActive && root.selectedIndex === index
@@ -494,7 +530,14 @@ Panel {
 
                 PanelActionButton {
                   id: unpairBtn
-                  visible: rowMouse.containsMouse || deviceRow.rowSelected
+                  // Not rowMouse.containsMouse as an extra OR — hovering
+                  // already routes through rowSelected (onContainsMouseChanged
+                  // sets selectedIndex/cursorActive), so adding it back in
+                  // here only reintroduces a stale-hover bug: the pointer
+                  // sitting unmoved over a row that keyboard nav has since
+                  // selected away from would keep this row's button visible
+                  // too, since containsMouse doesn't clear on its own.
+                  visible: deviceRow.rowSelected
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
                   iconText: "󰅙"

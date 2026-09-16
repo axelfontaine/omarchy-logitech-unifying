@@ -205,7 +205,7 @@ ERR_RESOURCE_ERROR = 0x09
 ERR_UNKNOWN_DEVICE = 0x08
 
 
-def device_online(fd, devnumber, timeout=0.8):
+def device_online(fd, devnumber, timeout=0.8, retries=1):
     """Whether the peripheral in this slot currently answers, addressed
     directly by its own device number (not the receiver's 0xFF) — a sleeping
     or out-of-range device fails here even though its pairing record still
@@ -213,7 +213,20 @@ def device_online(fd, devnumber, timeout=0.8):
     (root) function 1 (GetProtocolVersion) with a random mark byte, which
     HID++2.0 peripherals answer directly and HID++1.0 ones answer with a
     well-known "invalid sub-id" error — both of which mean "present"; a
-    timeout or a resource/unknown-device error means "not present"."""
+    timeout or a resource/unknown-device error means "not present".
+
+    Retries once by default: the receiver's RF link to an idle peripheral
+    can be in a slow-poll state after a stretch with no traffic (this tool
+    no longer polls in the background while its panel is closed), and the
+    very first ping can time out before the link catches up even though the
+    device is genuinely present and about to answer the next one."""
+    for attempt in range(retries + 1):
+        if _device_online_once(fd, devnumber, timeout):
+            return True
+    return False
+
+
+def _device_online_once(fd, devnumber, timeout):
     mark = random.randrange(256)
     frame = _pack_request(0x00, 0x10, bytes([0, 0, mark]), devnumber)
     os.write(fd, frame)
@@ -252,7 +265,7 @@ def get_feature_index(fd, devnumber, feature_id, timeout=0.4):
     return reply[0] or None
 
 
-def device_battery(fd, devnumber, timeout=0.4):
+def device_battery(fd, devnumber, timeout=0.4, retries=1):
     """(battery_percent, battery_status) for this device — either can be
     None. Tries the modern HID++2.0 UNIFIED_BATTERY feature first, then the
     older BATTERY_STATUS feature, then the legacy HID++1.0 BATTERY_CHARGE
@@ -264,7 +277,26 @@ def device_battery(fd, devnumber, timeout=0.4):
     decodes to "recharging" — so a device can be online with a real,
     meaningful status while genuinely having no numeric charge level to
     report at that moment). Matches Solaar's status_byte/charging_byte
-    split for this register (lib/logitech_receiver/hidpp10.py)."""
+    split for this register (lib/logitech_receiver/hidpp10.py).
+
+    Retries the whole chain once by default, same reasoning as
+    device_online's retry: right after the receiver's RF link to a
+    peripheral has been idle (or just reconnected), any single layer here
+    can time out even though the device is genuinely present — and unlike
+    device_online, a device that needs one of the legacy fallback layers
+    pays that cold-link tax up to four times in one call, one per layer,
+    with nothing here retrying a layer that fails. Observed live: this
+    left a keyboard needing the legacy registers with no battery reading
+    for several consecutive 4s poll cycles after a reconnect, while a
+    mouse answering on the first (modern) layer was unaffected."""
+    for attempt in range(retries + 1):
+        pct, status = _device_battery_once(fd, devnumber, timeout)
+        if pct is not None or status is not None:
+            return pct, status
+    return None, None
+
+
+def _device_battery_once(fd, devnumber, timeout):
     idx = get_feature_index(fd, devnumber, 0x1004, timeout)  # UNIFIED_BATTERY
     if idx:
         try:
